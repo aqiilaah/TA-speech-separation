@@ -272,7 +272,10 @@ def main():
     print(f'  ├── dev/   ({dev_count} mixtures, ~{dev_count * args.target_duration / 3600:.1f} hours)')
     print(f'  ├── test/  ({test_count} mixtures, ~{test_count * args.target_duration / 3600:.1f} hours)')
     print(f'  └── dataset_info.json')
-    print(f'\nTotal: {train_count + dev_count + test_count} mixtures')
-    print(f'Total duration: ~{(train_count + dev_count + test_count) * args.target_duration / 3600:.1f} hours')
+    print(f'\nStatic WAV mixtures: {train_count + dev_count + test_count}')
+    print(f'Static WAV duration: ~{(train_count + dev_count + test_count) * args.target_duration / 3600:.1f} hours')
+    if 'train' not in only_splits:
+        print(f'Dynamic train per epoch: ~{train_mixtures * args.target_duration / 3600:.1f} hours ({train_mixtures} mixtures; generated during training)')
+    print(f'Total dataset target: ~{args.target_hours:.1f} hours (train + dev + test)')
 if __name__ == '__main__':
     main()

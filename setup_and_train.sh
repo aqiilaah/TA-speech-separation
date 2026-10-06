@@ -2,7 +2,7 @@
 # Interactive setup and training for the clean TA-speech-separation repository.
 set -euo pipefail
 
-REPO_URL=https://github.com/Fadil-Tao/TA-speech-separation.git
+REPO_URL=https://github.com/aqiilaah/TA-speech-separation.git
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 CONFIG_FILE="$SCRIPT_DIR/setup_and_train.env"
 CONFIGURE=0
@@ -112,6 +112,21 @@ for value in "$EPOCHS" "$PRETRAIN_EPOCHS"; do
     [[ "$value" =~ ^[1-9][0-9]*$ ]] || die 'Epoch counts must be positive integers.'
 done
 [[ "$TARGET_HOURS" =~ ^[0-9]+([.][0-9]+)?$ ]] || die 'Dataset hours must be a positive number.'
+case "$MODEL" in
+    1|3|5) variant=skim ;;
+    2|4|6) variant=skim-attention ;;
+    7|8|9) variant=skim-multiscale ;;
+esac
+stem=${variant//-/_}
+speakers=2
+[[ "$MODEL" == 1 || "$MODEL" == 2 || "$MODEL" == 7 ]] || speakers=3
+training_script="train/${speakers}speaker/$variant/train_${stem}_${speakers}spk.py"
+training_scripts=("$training_script")
+if [[ "$MODEL" == 5 || "$MODEL" == 6 || "$MODEL" == 9 ]]; then
+    pretrain_script="train/2speaker/$variant/train_${stem}_2spk.py"
+    training_script="train/3speaker/$variant/train_${stem}_3spk_transfer.py"
+    training_scripts=("$pretrain_script" "$training_script")
+fi
 PROJECT_DIR=${PROJECT_DIR/#\~/$HOME}
 ensure_python
 PYTHON_BIN=$("$PYTHON_BIN" -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$PYTHON_BIN")
@@ -134,6 +149,9 @@ command -v git >/dev/null 2>&1 || die 'Install Git first.'
 if [[ -d "$PROJECT_DIR/.git" ]]; then
     remote=$(git -C "$PROJECT_DIR" config --get remote.origin.url)
     case "$remote" in
+        https://github.com/aqiilaah/TA-speech-separation|\
+        https://github.com/aqiilaah/TA-speech-separation.git|\
+        git@github.com:aqiilaah/TA-speech-separation.git|\
         https://github.com/Fadil-Tao/TA-speech-separation|\
         https://github.com/Fadil-Tao/TA-speech-separation.git|\
         git@github.com:Fadil-Tao/TA-speech-separation.git) ;;
@@ -145,10 +163,24 @@ else
 fi
 cd -- "$PROJECT_DIR"
 
-# Published GitHub code must include the local dynamic-mixing updates.
-"$PYTHON_BIN" - <<'PY'
+# Check required scripts explicitly: globbing alone misses absent model files.
+"$PYTHON_BIN" - "$REPO_URL" "${training_scripts[@]}" <<'PY'
 import ast
+import sys
 from pathlib import Path
+
+for filename in sys.argv[2:]:
+    path = Path(filename)
+    if not path.is_file():
+        raise SystemExit(
+            f'Checkout is missing required training script: {path}\n'
+            f'Project folder: {Path.cwd()}\n'
+            f'Use an updated checkout of {sys.argv[1]} and rerun --configure '
+            'to select it. Existing datasets and checkpoints can be kept.'
+        )
+    for option in ('--num-epochs', '--resume-from'):
+        if option not in path.read_text():
+            raise SystemExit(f'{path} lacks {option}. Update checkout first.')
 
 dataset = Path('train/datasets_utils.py').read_text()
 if 'class DynamicMixDataset' not in dataset:
@@ -175,9 +207,6 @@ for speakers in (2, 3):
     path = Path(f'dataset/generator/titml_mix_generator_{speakers}spk.py')
     if '--only-splits' not in path.read_text():
         raise SystemExit(f'{path} lacks --only-splits. Update clone first.')
-path = Path('train/3speaker/skim-attention/train_skim_attention_3spk.py')
-if '--num-epochs' not in path.read_text():
-    raise SystemExit(f'{path} lacks epoch/resume options. Update clone first.')
 PY
 
 stage 2 'Set up virtual environment and dependencies'
@@ -323,8 +352,6 @@ for split, count in expected.items():
             raise SystemExit(f'{split}/s{source}: missing or mismatched sources')
 PY
 }
-speakers=2
-[[ "$MODEL" == 1 || "$MODEL" == 2 || "$MODEL" == 7 ]] || speakers=3
 counts=("$speakers")
 if [[ "$MODEL" == 5 || "$MODEL" == 6 || "$MODEL" == 9 ]]; then
     counts=(2 3)
@@ -409,28 +436,19 @@ if len(history.get('val_losses', [])) < int(sys.argv[2]):
 PY
 }
 
-case "$MODEL" in
-    1|3|5) variant=skim ;;
-    2|4|6) variant=skim-attention ;;
-    7|8|9) variant=skim-multiscale ;;
-esac
-stem=${variant//-/_}
 if [[ "$MODEL" == 5 || "$MODEL" == 6 || "$MODEL" == 9 ]]; then
     source_dir="$TSS_CHECKPOINT_DIR/2speaker/$variant"
     if [[ ! -f "$source_dir/best_model.pth" ]]; then
         printf 'Transfer source missing; training %s with 2 speakers first.\n' "$variant"
-        run_training "train/2speaker/$variant/train_${stem}_2spk.py" \
-            "$source_dir" "$PRETRAIN_EPOCHS"
+        run_training "$pretrain_script" "$source_dir" "$PRETRAIN_EPOCHS"
     fi
     # Avoid an inherited override redirecting transfer to a different checkpoint.
     export TSS_PRETRAINED_PATH="$source_dir/best_model.pth"
     output_dir="$TSS_CHECKPOINT_DIR/3speaker/${variant}-transfer"
-    run_training "train/3speaker/$variant/train_${stem}_3spk_transfer.py" \
-        "$output_dir" "$EPOCHS"
+    run_training "$training_script" "$output_dir" "$EPOCHS"
 else
     output_dir="$TSS_CHECKPOINT_DIR/${speakers}speaker/$variant"
-    run_training "train/${speakers}speaker/$variant/train_${stem}_${speakers}spk.py" \
-        "$output_dir" "$EPOCHS"
+    run_training "$training_script" "$output_dir" "$EPOCHS"
 fi
 
 stage 7 'Finished'

@@ -75,6 +75,10 @@ wizard adalah **10 jam**: 8 jam train dinamis per epoch (5.760 campuran),
 berdurasi 5 detik. Pilihan 50 jam tetap tersedia: 28.800 campuran train
 per epoch, 3.600 dev, dan 3.600 test.
 
+Ringkasan generator memisahkan durasi WAV statis dan train dinamis. Untuk
+pilihan 50 jam, `Static WAV duration` adalah 10 jam (5 jam dev + 5 jam test),
+`Dynamic train per epoch` adalah 40 jam, dan `Total dataset target` tetap 50 jam.
+
 Jam tersebut dihitung dari durasi **mixture**, bukan penjumlahan durasi
 seluruh source pembicara atau durasi rekaman mentah. Campuran train berubah
 setiap epoch; 10 jam bukan batas kumulatif untuk seluruh proses pelatihan.
@@ -101,10 +105,15 @@ split tersebut dengan seed yang sama. Sebelum training, jumlah mixture dan
 kesesuaian ID seluruh sumber diperiksa.
 
 Wizard dapat disalin ke mesin Linux lain dan menjalankan clone ke folder baru.
+Source clone adalah `https://github.com/aqiilaah/TA-speech-separation.git`.
 Checkout hasil clone harus sudah memuat pembaruan dynamic mixing,
 `--only-splits` pada kedua generator, serta CLI training terbaru. Pembaruan
 lokal harus dipublikasikan ke GitHub sebelum setup melalui clone baru dapat
 digunakan; wizard menghentikan proses jika checkout masih memakai train statis.
+Skrip model yang dipilih, termasuk sumber pretraining untuk transfer learning,
+diperiksa sebelum instalasi dependensi dan pembuatan dataset. Jika folder lama
+tidak memiliki skrip Multi-Scale, perbarui checkout atau jalankan `--configure`
+dan pilih checkout terbaru. Dataset dan checkpoint lama dapat tetap disimpan.
 
 ### Setup manual
 

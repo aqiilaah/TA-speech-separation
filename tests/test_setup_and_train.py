@@ -18,7 +18,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-REMOTE = 'https://github.com/Fadil-Tao/TA-speech-separation.git'
+REMOTE = 'https://github.com/aqiilaah/TA-speech-separation.git'
+LEGACY_REMOTE = 'https://github.com/Fadil-Tao/TA-speech-separation.git'
 
 FAKE_PYTHON = r'''import ast
 import json
@@ -238,9 +239,11 @@ class SetupAndTrainTest(unittest.TestCase):
             'FAKE_TEMPLATE': str(self.python),
             'HOME': str(self.root / 'home'),
             'PATH': str(self.bin),
-            'GIT_CONFIG_COUNT': '1',
+            'GIT_CONFIG_COUNT': '2',
             'GIT_CONFIG_KEY_0': f'url.{self.source.as_uri()}.insteadOf',
             'GIT_CONFIG_VALUE_0': REMOTE,
+            'GIT_CONFIG_KEY_1': f'url.{self.source.as_uri()}.insteadOf',
+            'GIT_CONFIG_VALUE_1': LEGACY_REMOTE,
         }
 
     def git(self, *args):
@@ -253,7 +256,7 @@ class SetupAndTrainTest(unittest.TestCase):
         self.project = self.root / f'project with spaces {model}'
         answers = [str(self.project), 'cpu', '0',
                    str(model), str(epochs)]
-        if model in (5, 6):
+        if model in (5, 6, 9):
             answers.append('1')
         answers.extend([str(hours), ''])
         return subprocess.run(
@@ -358,8 +361,8 @@ class SetupAndTrainTest(unittest.TestCase):
         self.assertTrue((self.project / 'dataset/zips/TITML-IDN.zip').exists())
         self.assertIn('[7/7] Finished', result.stdout)
 
-    def test_all_six_models_and_only_dev_test(self):
-        for model in range(1, 7):
+    def test_all_nine_models_and_only_dev_test(self):
+        for model in range(1, 10):
             with self.subTest(model=model):
                 result = self.run_wizard(model)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -372,6 +375,15 @@ class SetupAndTrainTest(unittest.TestCase):
                             if event['event'] == 'generate'))
         training = [e for e in self.events() if e['event'] == 'train']
         self.assertTrue(all(event['epoch_size'] == 576 for event in training))
+
+    def test_default_clone_uses_current_repository(self):
+        result = self.run_wizard(model=8)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        remote = subprocess.check_output(
+            ['git', '-C', str(self.project), 'config', '--get', 'remote.origin.url'],
+            text=True,
+        ).strip()
+        self.assertEqual(remote, REMOTE)
 
     def test_default_ten_hours_controls_train_dev_and_test(self):
         result = self.run_wizard(hours='')
@@ -391,6 +403,33 @@ class SetupAndTrainTest(unittest.TestCase):
         result = self.run_wizard(configure=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.events(), before)
+
+    def test_fifty_hours_reports_dynamic_train_and_static_duration(self):
+        for model in (1, 3):
+            with self.subTest(model=model):
+                result = self.run_wizard(model=model, hours='50')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('Dynamic train: 28800', result.stdout)
+                self.assertIn('Target total hours: 50.0h', result.stdout)
+                self.assertIn('Static WAV duration: ~10.0 hours', result.stdout)
+                self.assertIn('Dynamic train per epoch: ~40.0 hours', result.stdout)
+                self.assertNotIn('Total duration: ~10.0 hours', result.stdout)
+                info = next(self.project.glob('dataset/synthetic/*/dataset_info.json'))
+                self.assertEqual(json.loads(info.read_text()),
+                                 {'train': 0, 'dev': 3600, 'test': 3600})
+        training = [e for e in self.events() if e['event'] == 'train']
+        self.assertTrue(all(e['epoch_size'] == 28800 for e in training))
+
+    def test_missing_selected_training_script_stops_before_setup(self):
+        path = Path('train/3speaker/skim-multiscale/train_skim_multiscale_3spk.py')
+        (self.source / path).unlink()
+        self.git('add', '.')
+        self.git('-c', 'user.name=Fixture', '-c', 'user.email=test@example.test',
+                 'commit', '-m', 'fixture missing selected model')
+        result = self.run_wizard(model=8)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(str(path), result.stdout + result.stderr)
+        self.assertEqual(self.events(), [], result.stdout + result.stderr)
 
     def test_transfer_pretraining_and_saved_settings_rerun(self):
         result = self.run_wizard()
