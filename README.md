@@ -11,6 +11,7 @@ TTML-IDN.
 - Pemisahan suara dua dan tiga pembicara.
 - Model dasar SkiM.
 - Model SkiM dengan tambahan *intra-segment Multi-Head Self-Attention*.
+- Model SkiM dengan *Multi-Scale 1D Convolutional Encoder*.
 - *Transfer learning* dari model dua pembicara ke model tiga pembicara.
 - Pembuatan campuran data latih secara *on-the-fly*.
 - Evaluasi SI-SNR pada seluruh *test set*.
@@ -26,10 +27,11 @@ TA-speech-separation/
 │   └── synthetic/          # Dataset sintetis (tidak disertakan)
 ├── implementation/
 │   ├── skim/               # Implementasi SkiM
-│   └── skim_attention/     # Implementasi SkiM + Attention
+│   ├── skim_attention/     # Implementasi SkiM + Attention
+│   └── skim_multiscale/    # Implementasi SkiM + Multi-Scale Encoder
 ├── train/
-│   ├── 2speaker/           # Pelatihan model dua pembicara
-│   ├── 3speaker/           # Pelatihan model tiga pembicara
+│   ├── 2speaker/           # Pelatihan model dua pembicara (skim, skim-attention, skim-multiscale)
+│   ├── 3speaker/           # Pelatihan model tiga pembicara (skim, skim-attention, skim-multiscale)
 │   └── datasets_utils.py   # DynamicMixDataset dan dataset statis
 ├── checkpoints/            # Hasil pelatihan (dibuat otomatis)
 ├── eval/run_eval.py        # Evaluasi test set
@@ -85,9 +87,9 @@ Untuk mengubah pilihan:
 bash setup_and_train.sh --configure
 ```
 
-Pilihan model mencakup enam konfigurasi pada bagian Pelatihan. Untuk transfer
-learning, wizard melatih model dua pembicara terlebih dahulu jika checkpoint
-sumber belum ada. Run berikutnya melanjutkan checkpoint epoch lengkap yang
+Pilihan model mencakup sembilan konfigurasi pada bagian Pelatihan (SkiM,
+SkiM + Attention, dan SkiM + Multi-Scale). Untuk transfer learning, wizard
+melatih model dua pembicara terlebih dahulu jika checkpoint sumber belum ada. Run berikutnya melanjutkan checkpoint epoch lengkap yang
 tersedia; run yang sudah mencapai jumlah epoch tujuan dilewati. Log disimpan
 dalam `run.log` di folder checkpoint masing-masing model.
 
@@ -238,6 +240,9 @@ python train/2speaker/skim/train_skim_2spk.py
 
 # SkiM + Attention
 python train/2speaker/skim-attention/train_skim_attention_2spk.py
+
+# SkiM + Multi-Scale Encoder
+python train/2speaker/skim-multiscale/train_skim_multiscale_2spk.py
 ```
 
 Checkpoint terbaik akan disimpan di:
@@ -245,6 +250,7 @@ Checkpoint terbaik akan disimpan di:
 ```text
 checkpoints/2speaker/skim/best_model.pth
 checkpoints/2speaker/skim-attention/best_model.pth
+checkpoints/2speaker/skim-multiscale/best_model.pth
 ```
 
 ### Model tiga pembicara dari awal
@@ -255,6 +261,9 @@ python train/3speaker/skim/train_skim_3spk.py
 
 # SkiM + Attention
 python train/3speaker/skim-attention/train_skim_attention_3spk.py
+
+# SkiM + Multi-Scale Encoder
+python train/3speaker/skim-multiscale/train_skim_multiscale_3spk.py
 ```
 
 ### Model tiga pembicara dengan transfer learning
@@ -268,6 +277,9 @@ python train/3speaker/skim/train_skim_3spk_transfer.py
 
 # Transfer SkiM + Attention 2 pembicara ke 3 pembicara
 python train/3speaker/skim-attention/train_skim_attention_3spk_transfer.py
+
+# Transfer SkiM + Multi-Scale Encoder 2 pembicara ke 3 pembicara
+python train/3speaker/skim-multiscale/train_skim_multiscale_3spk_transfer.py
 ```
 
 Checkpoint model tiga pembicara disimpan di:
@@ -275,8 +287,10 @@ Checkpoint model tiga pembicara disimpan di:
 ```text
 checkpoints/3speaker/skim/best_model.pth
 checkpoints/3speaker/skim-attention/best_model.pth
+checkpoints/3speaker/skim-multiscale/best_model.pth
 checkpoints/3speaker/skim-transfer/best_model.pth
 checkpoints/3speaker/skim-attention-transfer/best_model.pth
+checkpoints/3speaker/skim-multiscale-transfer/best_model.pth
 ```
 
 ### Melanjutkan pelatihan

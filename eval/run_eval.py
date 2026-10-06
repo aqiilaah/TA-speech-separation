@@ -15,6 +15,11 @@ from espnet2.enh.encoder.conv_encoder import ConvEncoder
 from espnet2.enh.decoder.conv_decoder import ConvDecoder
 from implementation.skim.skim_separator import SkiMSeparator
 from implementation.skim_attention.skim_attention_separator import SkiMAttentionSeparator
+from implementation.skim_multiscale.multiscale_encoder import MultiScaleConvEncoder
+from implementation.skim_multiscale.skim_multiscale_separator import (
+    SkiMMultiScaleSeparator,
+)
+from implementation.skim_multiscale.multiscale_decoder import MultiScaleConvDecoder
 SAMPLE_RATE = 16000
 TARGET_LEN = SAMPLE_RATE * 5
 EPS = 1e-08
@@ -39,6 +44,8 @@ def build_config(num_spk: int, arch: str) -> dict:
     cfg['separator']['num_spk'] = num_spk
     if arch == 'attention':
         cfg['separator']['num_heads'] = 4
+    elif arch == 'multiscale':
+        cfg['encoder'] = {'channel': 256, 'out_channel': 256, 'kernel_sizes': (16, 32, 64), 'stride': 8, 'causal': False}
     return cfg
 
 def parse_model_name(name: str) -> tuple[int, str]:
@@ -48,7 +55,12 @@ def parse_model_name(name: str) -> tuple[int, str]:
         num_spk = 3
     else:
         raise ValueError(f'cannot parse num_spk from {name}')
-    arch = 'attention' if 'skim-attention' in name else 'skim'
+    if 'skim-multiscale' in name:
+        arch = 'multiscale'
+    elif 'skim-attention' in name:
+        arch = 'attention'
+    else:
+        arch = 'skim'
     return (num_spk, arch)
 
 def read_model_list() -> list[tuple[str, str]]:
@@ -134,11 +146,17 @@ def build_model(num_spk: int, arch: str, ckpt_path: Path):
     cfg = state.get('config') or build_config(num_spk, arch)
     sep_cfg = dict(cfg['separator'])
     sep_cfg.setdefault('num_spk', num_spk)
-    enc = ConvEncoder(**cfg['encoder'])
-    dec = ConvDecoder(**cfg['decoder'])
-    if arch == 'skim':
+    if arch == 'multiscale':
+        enc = MultiScaleConvEncoder(**cfg['encoder'])
+        dec = MultiScaleConvDecoder(**cfg['decoder'])
+        sep = SkiMMultiScaleSeparator(**{k: v for k, v in sep_cfg.items() if k in _SKIM_KEYS})
+    elif arch == 'skim':
+        enc = ConvEncoder(**cfg['encoder'])
+        dec = ConvDecoder(**cfg['decoder'])
         sep = SkiMSeparator(**{k: v for k, v in sep_cfg.items() if k in _SKIM_KEYS})
     elif arch == 'attention':
+        enc = ConvEncoder(**cfg['encoder'])
+        dec = ConvDecoder(**cfg['decoder'])
         sep = SkiMAttentionSeparator(**{k: v for k, v in sep_cfg.items() if k in _ATTN_KEYS})
     else:
         raise ValueError(arch)

@@ -88,11 +88,14 @@ else
         '  3. SkiM, 3 speakers' \
         '  4. SkiM + Attention, 3 speakers' \
         '  5. SkiM transfer, 2 speakers to 3 speakers' \
-        '  6. SkiM + Attention transfer, 2 speakers to 3 speakers'
+        '  6. SkiM + Attention transfer, 2 speakers to 3 speakers' \
+        '  7. SkiM + Multi-Scale, 2 speakers' \
+        '  8. SkiM + Multi-Scale, 3 speakers' \
+        '  9. SkiM + Multi-Scale transfer, 2 speakers to 3 speakers'
     ask MODEL 'Model number' 2
     ask EPOCHS 'Total training epochs (1 for an initial trial)' 100
     PRETRAIN_EPOCHS=100
-    if [[ "$MODEL" == 5 || "$MODEL" == 6 ]]; then
+    if [[ "$MODEL" == 5 || "$MODEL" == 6 || "$MODEL" == 9 ]]; then
         ask PRETRAIN_EPOCHS 'Two-speaker pretraining epochs if source is missing' 100
     fi
     printf '\nHours refer to mixtures, not raw recordings or all epochs combined.\n'
@@ -104,7 +107,7 @@ fi
 
 [[ "$DEVICE" == cuda || "$DEVICE" == cpu ]] || die 'Device must be cuda or cpu.'
 [[ "$GPU_ID" =~ ^[0-9]+$ ]] || die 'GPU index must be a nonnegative integer.'
-[[ "$MODEL" =~ ^[1-6]$ ]] || die 'Choose model 1 through 6.'
+[[ "$MODEL" =~ ^[1-9]$ ]] || die 'Choose model 1 through 9.'
 for value in "$EPOCHS" "$PRETRAIN_EPOCHS"; do
     [[ "$value" =~ ^[1-9][0-9]*$ ]] || die 'Epoch counts must be positive integers.'
 done
@@ -321,9 +324,9 @@ for split, count in expected.items():
 PY
 }
 speakers=2
-[[ "$MODEL" == 1 || "$MODEL" == 2 ]] || speakers=3
+[[ "$MODEL" == 1 || "$MODEL" == 2 || "$MODEL" == 7 ]] || speakers=3
 counts=("$speakers")
-if [[ "$MODEL" == 5 || "$MODEL" == 6 ]]; then
+if [[ "$MODEL" == 5 || "$MODEL" == 6 || "$MODEL" == 9 ]]; then
     counts=(2 3)
 fi
 for count in "${counts[@]}"; do
@@ -406,10 +409,13 @@ if len(history.get('val_losses', [])) < int(sys.argv[2]):
 PY
 }
 
-variant=skim
-[[ "$MODEL" == 1 || "$MODEL" == 3 || "$MODEL" == 5 ]] || variant=skim-attention
+case "$MODEL" in
+    1|3|5) variant=skim ;;
+    2|4|6) variant=skim-attention ;;
+    7|8|9) variant=skim-multiscale ;;
+esac
 stem=${variant//-/_}
-if [[ "$MODEL" == 5 || "$MODEL" == 6 ]]; then
+if [[ "$MODEL" == 5 || "$MODEL" == 6 || "$MODEL" == 9 ]]; then
     source_dir="$TSS_CHECKPOINT_DIR/2speaker/$variant"
     if [[ ! -f "$source_dir/best_model.pth" ]]; then
         printf 'Transfer source missing; training %s with 2 speakers first.\n' "$variant"

@@ -44,6 +44,11 @@ from implementation.skim.skim_separator import SkiMSeparator
 from implementation.skim_attention.skim_attention_separator import (
     SkiMAttentionSeparator,
 )
+from implementation.skim_multiscale.multiscale_encoder import MultiScaleConvEncoder
+from implementation.skim_multiscale.skim_multiscale_separator import (
+    SkiMMultiScaleSeparator,
+)
+from implementation.skim_multiscale.multiscale_decoder import MultiScaleConvDecoder
 
 SAMPLE_RATE = 16000
 
@@ -72,11 +77,15 @@ _SKIM_KEYS = {
 _ATTN_KEYS = _SKIM_KEYS | {"num_heads"}
 
 
-def detect_arch(separator_cfg: dict) -> str:
-    """Tentukan arsitektur dari konfigurasi separator.
+def detect_arch(separator_cfg: dict, enc_cfg: dict = None) -> str:
+    """Tentukan arsitektur dari konfigurasi separator dan encoder.
 
-    SkiM-Attention selalu memiliki 'num_heads'; SkiM biasa tidak.
+    - 'multiscale' jika encoder memiliki 'kernel_sizes'
+    - 'attention' jika separator memiliki 'num_heads'
+    - 'skim' untuk SkiM standar
     """
+    if enc_cfg and "kernel_sizes" in enc_cfg:
+        return "multiscale"
     return "attention" if "num_heads" in separator_cfg else "skim"
 
 
@@ -93,16 +102,22 @@ def load_model(checkpoint_path: Path, device: torch.device):
     dec_cfg = config.get("decoder", DEFAULT_CONFIG["decoder"])
     sep_cfg = config.get("separator", DEFAULT_CONFIG["separator"])
 
-    arch = detect_arch(sep_cfg)
+    arch = detect_arch(sep_cfg, enc_cfg)
     num_spk = sep_cfg.get("num_spk", 2)
 
-    encoder = ConvEncoder(**enc_cfg)
-    decoder = ConvDecoder(**dec_cfg)
-
-    if arch == "attention":
+    if arch == "multiscale":
+        encoder = MultiScaleConvEncoder(**enc_cfg)
+        decoder = MultiScaleConvDecoder(**dec_cfg)
+        kwargs = {k: v for k, v in sep_cfg.items() if k in _SKIM_KEYS}
+        separator = SkiMMultiScaleSeparator(**kwargs)
+    elif arch == "attention":
+        encoder = ConvEncoder(**enc_cfg)
+        decoder = ConvDecoder(**dec_cfg)
         kwargs = {k: v for k, v in sep_cfg.items() if k in _ATTN_KEYS}
         separator = SkiMAttentionSeparator(**kwargs)
     else:
+        encoder = ConvEncoder(**enc_cfg)
+        decoder = ConvDecoder(**dec_cfg)
         kwargs = {k: v for k, v in sep_cfg.items() if k in _SKIM_KEYS}
         separator = SkiMSeparator(**kwargs)
 
