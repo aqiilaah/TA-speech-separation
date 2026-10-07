@@ -1,5 +1,11 @@
 import sys
+import contextlib
+import importlib.util
+import io
+import os
+import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 # Add project root to sys.path
@@ -291,7 +297,237 @@ class TestSkiMMultiScale(unittest.TestCase):
         masked_3spk, _, _ = sep_3spk(feat, flens)
         self.assertEqual(len(masked_3spk), 3)
 
+    def test_scale_reconstruction_alignment_and_lengths(self):
+        """Impulse coordinates survive each scale's analysis/synthesis padding."""
+        for causal in (False, True):
+            encoder = MultiScaleConvEncoder(channel=1, preserve_scales=True, causal=causal)
+            decoder = MultiScaleConvDecoder(channel=1, kernel_sizes=(16, 32, 64), causal=causal)
+            for enc, dec, k in zip(encoder.conv_branches, decoder.deconv_branches, encoder.kernel_sizes):
+                left = k - 8 if causal else (k - 8) // 2
+                with torch.no_grad():
+                    enc.weight.zero_()
+                    dec.weight.zero_()
+                    enc.weight[0, 0, left] = 1
+                    dec.weight[0, 0, left] = 1
+            for length in (1, 7, 8, 9, 17, 65):
+                with self.subTest(causal=causal, length=length):
+                    audio = torch.zeros(2, length)
+                    audio[:, ::8] = 1
+                    lengths = torch.tensor([length, max(1, length - 8)])
+                    audio[1, lengths[1]:] = 0
+                    features, flens = encoder(audio, lengths)
+                    self.assertEqual(features.shape, (2, (length + 7) // 8, 3))
+                    torch.testing.assert_close(flens, (lengths + 7) // 8)
+                    waveforms, olens = decoder.forward_scales(features, lengths)
+                    torch.testing.assert_close(olens, lengths)
+                    self.assertEqual(len(waveforms), 3)
+                    for waveform in waveforms:
+                        torch.testing.assert_close(waveform, audio)
+                    selected, _ = decoder(features, lengths)
+                    torch.testing.assert_close(selected, waveforms[0])
+
+    def test_scale_masks_preserve_original_features(self):
+        """Fusion belongs only to mask estimation; each mask multiplies W_i."""
+        encoder = MultiScaleConvEncoder(channel=4, preserve_scales=True)
+        audio = torch.randn(2, 65)
+        features, flens = encoder(audio, torch.tensor([65, 49]))
+        self.assertEqual(encoder.output_dim, 12)
+        self.assertTrue((features >= 0).all())
+        separator = SkiMMultiScaleSeparator(input_dim=4, num_scales=3, layer=1, unit=4, segment_size=4)
+        masked, _, others = separator(features, flens)
+        for s, source in enumerate(masked, 1):
+            torch.testing.assert_close(source, features * others[f"mask_spk{s}"])
+            self.assertEqual(source.shape[-1], 12)
+
+    def test_multiscale_shared_pit(self):
+        """Conflicting scale assignments must not get independent zero losses."""
+        from espnet2.enh.loss.criterions.time_domain import TimeDomainMSE
+        from implementation.skim_multiscale.multiscale_model import MultiScalePITSolver
+
+        refs = [torch.zeros(2, 8), torch.ones(2, 8)]
+        estimates = [
+            [refs[0].clone(), refs[1].clone()],
+            [refs[1].clone(), refs[0].clone()],
+            [refs[1].clone(), refs[0].clone()],
+        ]
+        solver = MultiScalePITSolver(TimeDomainMSE())
+        loss, _, others = solver(refs, estimates)
+        torch.testing.assert_close(loss, torch.tensor(0.2))
+        torch.testing.assert_close(others["perm"], torch.tensor([[0, 1], [0, 1]]))
+
+        # Changing only padding must not change the objective.
+        for scale in estimates:
+            for estimate in scale:
+                estimate[1, 4:] = 100
+        lengths = torch.tensor([8, 4])
+        loss, _, _ = solver(refs, estimates, {"speech_lengths": lengths})
+        torch.testing.assert_close(loss, torch.tensor(0.2))
+
+    def test_multiscale_espnet_loss_and_gradients(self):
+        """The real ESPnet forward/loss must train every analysis/synthesis branch."""
+        from espnet2.enh.loss.criterions.time_domain import SISNRLoss
+        from implementation.skim_multiscale.multiscale_model import (
+            MultiScaleEnhancementModel, MultiScalePITSolver,
+        )
+
+        for num_spk in (2, 3):
+            with self.subTest(num_spk=num_spk):
+                encoder = MultiScaleConvEncoder(channel=8, preserve_scales=True)
+                separator = SkiMMultiScaleSeparator(
+                    input_dim=8, num_scales=3, num_spk=num_spk, layer=2,
+                    unit=8, segment_size=4, nonlinear="sigmoid", dropout=0,
+                )
+                decoder = MultiScaleConvDecoder(channel=8, kernel_sizes=(16, 32, 64))
+                solver = MultiScalePITSolver(SISNRLoss(clamp_db=30))
+                model = MultiScaleEnhancementModel(encoder, separator, decoder, None, [solver])
+                refs = {f"speech_ref{s + 1}": torch.randn(2, 129) for s in range(num_spk)}
+                mixture = sum(refs.values())
+                loss, stats, weight = model(mixture, torch.tensor([129, 113]), **refs)
+                self.assertTrue(torch.isfinite(loss))
+                self.assertIn("loss", stats)
+                self.assertEqual(weight.item(), 2)
+                loss.backward()
+                for branch in list(encoder.conv_branches) + list(decoder.deconv_branches):
+                    self.assertIsNotNone(branch.weight.grad)
+                    self.assertTrue(torch.isfinite(branch.weight.grad).all())
+                    self.assertGreater(branch.weight.grad.abs().sum().item(), 0)
+                self.assertGreater(separator.input_proj.weight.grad.abs().sum().item(), 0)
+
+    def test_decoder_scale_isolation(self):
+        decoder = MultiScaleConvDecoder(channel=4, kernel_sizes=(16, 32, 64))
+        features = torch.randn(1, 5, 12)
+        lengths = torch.tensor([33])
+        original, _ = decoder.forward_scales(features, lengths)
+        features[..., 4:8] = 0
+        changed, _ = decoder.forward_scales(features, lengths)
+        torch.testing.assert_close(original[0], changed[0])
+        torch.testing.assert_close(original[2], changed[2])
+        self.assertFalse(torch.equal(original[1], changed[1]))
+
+    def test_independent_strides_alignment_and_gradients(self):
+        for strides in ((8, 16, 32), (12, 8, 24), (7, 11, 13)):
+            with self.subTest(strides=strides):
+                encoder = MultiScaleConvEncoder(channel=4, stride=strides, preserve_scales=True)
+                decoder = MultiScaleConvDecoder(channel=4, kernel_sizes=(16, 32, 64), stride=strides)
+                for conv, deconv, stride in zip(encoder.conv_branches, decoder.deconv_branches, strides):
+                    self.assertEqual(conv.stride, (stride,))
+                    self.assertEqual(deconv.stride, (stride,))
+                for length in (1, 9, 65):
+                    audio = torch.randn(2, length, requires_grad=True)
+                    lengths = torch.tensor([length, max(1, length // 2)])
+                    features, flens = encoder(audio, lengths)
+                    self.assertEqual(features.size(1), (length + min(strides) - 1) // min(strides))
+                    torch.testing.assert_close(flens, (lengths + min(strides) - 1) // min(strides))
+                    waveforms, _ = decoder.forward_scales(features, lengths)
+                    for waveform in waveforms:
+                        self.assertEqual(waveform.shape, audio.shape)
+                        self.assertTrue(torch.isfinite(waveform).all())
+                        self.assertTrue((waveform[1, lengths[1]:] == 0).all())
+                    sum(w.square().mean() for w in waveforms).backward()
+                    self.assertTrue(torch.isfinite(audio.grad).all())
+                for branch in list(encoder.conv_branches) + list(decoder.deconv_branches):
+                    self.assertGreater(branch.weight.grad.abs().sum().item(), 0)
+
+    def test_multiscale_settings_validation(self):
+        from utils.multiscale_config import parse_multiscale_settings
+
+        self.assertEqual(parse_multiscale_settings('40/80/160', '10/20/40'),
+                         ((40, 80, 160), (10, 20, 40)))
+        self.assertEqual(parse_multiscale_settings('16/32/64', '8'),
+                         ((16, 32, 64), (8, 8, 8)))
+        for kernels, strides in (('1/2', '1'), ('32/16/64', '8'),
+                                 ('16/32/64', '0'), ('16/32/64', '8/16'),
+                                 ('16/32/64', '17/16/32')):
+            with self.assertRaises(ValueError):
+                parse_multiscale_settings(kernels, strides)
+
+    def test_training_configs_and_checkpoint_loaders(self):
+        """Exercise the real builders and both checkpoint consumers, old and new."""
+        def load_script(relative):
+            path = PROJECT_ROOT / relative
+            spec = importlib.util.spec_from_file_location(path.stem, path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
+        inference = load_script("inference/separate.py")
+        evaluation = load_script("eval/run_eval.py")
+        device = torch.device("cpu")
+        evaluation.device = device
+        scripts = (
+            "train/2speaker/skim-multiscale/train_skim_multiscale_2spk.py",
+            "train/3speaker/skim-multiscale/train_skim_multiscale_3spk.py",
+            "train/3speaker/skim-multiscale/train_skim_multiscale_3spk_transfer.py",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for script in scripts:
+                with self.subTest(script=script):
+                    with mock.patch.dict(os.environ, {
+                        'TSS_MULTISCALE_KERNELS': '40/80/160',
+                        'TSS_MULTISCALE_STRIDES': '10/20/40',
+                    }):
+                        trainer = load_script(script)
+                    cfg = trainer.MODEL_CONFIG
+                    self.assertTrue(cfg["encoder"]["preserve_scales"])
+                    for component in ('encoder', 'decoder'):
+                        self.assertEqual(cfg[component]['kernel_sizes'], (40, 80, 160))
+                        self.assertEqual(cfg[component]['stride'], (10, 20, 40))
+                    self.assertEqual(cfg["separator"]["num_scales"], len(cfg["decoder"]["kernel_sizes"]))
+                    # Keep the production builder/config path, with a small CPU model.
+                    cfg["encoder"]["channel"] = 8
+                    cfg["decoder"]["channel"] = 8
+                    cfg["separator"].update(input_dim=8, unit=8, layer=2, segment_size=4)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        if "transfer" in script:
+                            model = trainer.build_model(device, Path(directory) / "2spk.pth")
+                        else:
+                            model = trainer.build_model(device)
+                    mixture = torch.randn(1, 129)
+                    refs = {f"speech_ref{i + 1}": torch.randn_like(mixture) for i in range(model.num_spk)}
+                    with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
+                        loss, _, _ = model(mixture, torch.tensor([129]), **refs)
+                    self.assertTrue(torch.isfinite(loss))
+                    loss.backward()
+                    for branch in model.decoder.deconv_branches:
+                        self.assertTrue(torch.isfinite(branch.weight.grad).all())
+
+                    checkpoint = Path(directory) / "new.pth"
+                    torch.save({"model_state_dict": model.state_dict(), "config": cfg}, checkpoint)
+                    if model.num_spk == 2:
+                        torch.save({"model_state_dict": model.state_dict(), "config": cfg}, Path(directory) / "2spk.pth")
+                    enc, sep, dec, num_spk, arch = inference.load_model(checkpoint, device)
+                    self.assertEqual((num_spk, arch), (model.num_spk, "multiscale"))
+                    actual = inference.separate(enc, sep, dec, mixture.numpy()[0], device)
+                    # Dropout is disabled in loaded models.
+                    model.eval()
+                    expected = inference.separate(model.encoder, model.separator, model.decoder, mixture.numpy()[0], device)
+                    for want, got in zip(expected, actual):
+                        torch.testing.assert_close(torch.from_numpy(want), torch.from_numpy(got))
+                    enc, sep, dec = evaluation.build_model(num_spk, arch, checkpoint)
+                    actual = evaluation.separate(enc, sep, dec, mixture.numpy()[0])
+                    for want, got in zip(expected, actual):
+                        torch.testing.assert_close(torch.from_numpy(want), torch.from_numpy(got))
+
+            legacy_cfg = evaluation.build_config(2, "multiscale")
+            legacy_cfg["encoder"].update(channel=8, out_channel=8)
+            legacy_cfg["decoder"]["channel"] = 8
+            legacy_cfg["separator"].update(input_dim=8, unit=8, layer=1, segment_size=4)
+            enc = MultiScaleConvEncoder(**legacy_cfg["encoder"])
+            sep_cfg = {k: v for k, v in legacy_cfg["separator"].items() if k in inference._MULTISCALE_KEYS}
+            sep = SkiMMultiScaleSeparator(**sep_cfg)
+            dec = MultiScaleConvDecoder(**legacy_cfg["decoder"])
+            modules = {"encoder": enc, "separator": sep, "decoder": dec}
+            state = {f"{name}.{k}": v for name, module in modules.items() for k, v in module.state_dict().items()}
+            checkpoint = Path(directory) / "old.pth"
+            torch.save({"model_state_dict": state, "config": legacy_cfg}, checkpoint)
+            loaded = inference.load_model(checkpoint, device)[:3]
+            evaluated = evaluation.build_model(2, "multiscale", checkpoint)
+            for triplet in (loaded, evaluated):
+                for original, restored in zip(modules.values(), triplet):
+                    self.assertEqual(original.state_dict().keys(), restored.state_dict().keys())
+                    for k, value in original.state_dict().items():
+                        torch.testing.assert_close(value, restored.state_dict()[k])
+
 
 if __name__ == "__main__":
     unittest.main()
-

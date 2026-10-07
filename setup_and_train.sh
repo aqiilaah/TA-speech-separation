@@ -12,6 +12,7 @@ case "${1:-}" in
         printf '%s\n' \
             'Usage: bash setup_and_train.sh [--configure]' \
             'First run asks for paths, model, epochs, total dataset hours, and ZIP source.' \
+            'Multi-Scale models also ask for three kernel sizes and strides (e.g. 16/32/64 and 8/16/32).' \
             'Python 3.10/3.11 is detected automatically; missing Python 3.11 is installed with uv.' \
             'Later runs reuse setup_and_train.env and resume completed checkpoints.' \
             'Use --configure to change saved choices. ZIP passwords are not saved.' \
@@ -66,6 +67,8 @@ ensure_python() {
     printf 'Using installed Python: %s\n' "$PYTHON_BIN"
 }
 
+MULTISCALE_KERNELS=16/32/64
+MULTISCALE_STRIDES=8/8/8
 if [[ -f "$CONFIG_FILE" && "$CONFIGURE" == 0 ]]; then
     # This file is generated below with shell-escaped values and mode 600.
     # shellcheck disable=SC1090
@@ -93,6 +96,11 @@ else
         '  8. SkiM + Multi-Scale, 3 speakers' \
         '  9. SkiM + Multi-Scale transfer, 2 speakers to 3 speakers'
     ask MODEL 'Model number' 2
+    if [[ "$MODEL" == 7 || "$MODEL" == 8 || "$MODEL" == 9 ]]; then
+        printf '\nMulti-Scale sizes are in audio samples, ordered short/middle/long.\n'
+        ask MULTISCALE_KERNELS 'Kernel sizes (short/middle/long)' 16/32/64
+        ask MULTISCALE_STRIDES 'Strides (short/middle/long; one value uses a shared stride)' 8/8/8
+    fi
     ask EPOCHS 'Total training epochs (1 for an initial trial)' 100
     PRETRAIN_EPOCHS=100
     if [[ "$MODEL" == 5 || "$MODEL" == 6 || "$MODEL" == 9 ]]; then
@@ -138,12 +146,6 @@ if [[ -f "$ZIP_SOURCE" ]]; then
     ZIP_SOURCE=$("$PYTHON_BIN" -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$ZIP_SOURCE")
 fi
 
-umask 077
-for variable in PROJECT_DIR PYTHON_BIN DEVICE GPU_ID MODEL EPOCHS PRETRAIN_EPOCHS TARGET_HOURS ZIP_SOURCE; do
-    printf '%s=%q\n' "$variable" "${!variable}"
-done > "$CONFIG_FILE.tmp"
-mv -- "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-
 stage 1 'Clone clean project'
 command -v git >/dev/null 2>&1 || die 'Install Git first.'
 if [[ -d "$PROJECT_DIR/.git" ]]; then
@@ -181,6 +183,10 @@ for filename in sys.argv[2:]:
     for option in ('--num-epochs', '--resume-from'):
         if option not in path.read_text():
             raise SystemExit(f'{path} lacks {option}. Update checkout first.')
+    if path.parent.name == 'skim-multiscale':
+        if ('apply_multiscale_environment' not in path.read_text()
+                or not Path('utils/multiscale_config.py').is_file()):
+            raise SystemExit(f'{path} lacks configurable multiscale sizes. Update checkout first.')
 
 dataset = Path('train/datasets_utils.py').read_text()
 if 'class DynamicMixDataset' not in dataset:
@@ -208,6 +214,20 @@ for speakers in (2, 3):
     if '--only-splits' not in path.read_text():
         raise SystemExit(f'{path} lacks --only-splits. Update clone first.')
 PY
+
+checkpoint_variant=$variant
+if [[ "$variant" == skim-multiscale ]]; then
+    settings=$("$PYTHON_BIN" utils/multiscale_config.py "$MULTISCALE_KERNELS" "$MULTISCALE_STRIDES") ||
+        die 'Invalid multiscale configuration. Rerun --configure to change the sizes.'
+    read -r MULTISCALE_KERNELS MULTISCALE_STRIDES <<< "$settings"
+    checkpoint_variant="$variant-k${MULTISCALE_KERNELS//\//_}-s${MULTISCALE_STRIDES//\//_}"
+    printf 'Multi-Scale kernels: %s; strides: %s\n' "$MULTISCALE_KERNELS" "$MULTISCALE_STRIDES"
+fi
+umask 077
+for variable in PROJECT_DIR PYTHON_BIN DEVICE GPU_ID MODEL EPOCHS PRETRAIN_EPOCHS TARGET_HOURS ZIP_SOURCE MULTISCALE_KERNELS MULTISCALE_STRIDES; do
+    printf '%s=%q\n' "$variable" "${!variable}"
+done > "$CONFIG_FILE.tmp"
+mv -- "$CONFIG_FILE.tmp" "$CONFIG_FILE"
 
 stage 2 'Set up virtual environment and dependencies'
 if [[ -e .venv || -L .venv ]] && ! python_is_compatible .venv/bin/python; then
@@ -245,6 +265,10 @@ export TSS_RAW_DIR="$PROJECT_DIR/dataset/raw/TTML-IDN"
 export TSS_SYNTHETIC_DIR="$PROJECT_DIR/dataset/synthetic"
 export TSS_CHECKPOINT_DIR="$PROJECT_DIR/checkpoints"
 export TSS_TRAIN_EPOCH_SIZE="$TRAIN_EPOCH_SIZE"
+if [[ "$variant" == skim-multiscale ]]; then
+    export TSS_MULTISCALE_KERNELS="$MULTISCALE_KERNELS"
+    export TSS_MULTISCALE_STRIDES="$MULTISCALE_STRIDES"
+fi
 
 stage 3 'Download TITML source ZIP'
 ZIP_PATH="$PROJECT_DIR/dataset/zips/TITML-IDN.zip"
@@ -419,6 +443,12 @@ if checkpoints:
 PY
     )
     command=(python -u "$script" --num-epochs "$epochs")
+    if [[ "$variant" == skim-multiscale ]]; then
+        command+=(--checkpoint-dir "$checkpoint_dir")
+        if [[ "$script" == *_transfer.py ]]; then
+            command+=(--pretrained "$TSS_PRETRAINED_PATH")
+        fi
+    fi
     if [[ -n "$resume" ]]; then
         printf 'Resuming completed checkpoint: %s\n' "$resume"
         command+=(--resume-from "$resume")
@@ -437,17 +467,17 @@ PY
 }
 
 if [[ "$MODEL" == 5 || "$MODEL" == 6 || "$MODEL" == 9 ]]; then
-    source_dir="$TSS_CHECKPOINT_DIR/2speaker/$variant"
+    source_dir="$TSS_CHECKPOINT_DIR/2speaker/$checkpoint_variant"
     if [[ ! -f "$source_dir/best_model.pth" ]]; then
         printf 'Transfer source missing; training %s with 2 speakers first.\n' "$variant"
         run_training "$pretrain_script" "$source_dir" "$PRETRAIN_EPOCHS"
     fi
     # Avoid an inherited override redirecting transfer to a different checkpoint.
     export TSS_PRETRAINED_PATH="$source_dir/best_model.pth"
-    output_dir="$TSS_CHECKPOINT_DIR/3speaker/${variant}-transfer"
+    output_dir="$TSS_CHECKPOINT_DIR/3speaker/${checkpoint_variant}-transfer"
     run_training "$training_script" "$output_dir" "$EPOCHS"
 else
-    output_dir="$TSS_CHECKPOINT_DIR/${speakers}speaker/$variant"
+    output_dir="$TSS_CHECKPOINT_DIR/${speakers}speaker/$checkpoint_variant"
     run_training "$training_script" "$output_dir" "$EPOCHS"
 fi
 

@@ -156,12 +156,34 @@ if args and args[0] == '-u':
     if '_transfer.py' in file.name:
         variant += '-transfer'
     destination = Path('checkpoints') / f'{speakers}speaker' / variant
+    config = None
+    if '--checkpoint-dir' in args:
+        assert '--checkpoint-dir' in flags
+        destination = Path(args[args.index('--checkpoint-dir') + 1])
+    if 'skim-multiscale' in variant:
+        sys.path.insert(0, str(Path.cwd()))
+        from utils.multiscale_config import apply_multiscale_environment
+        config_node = next(node for node in tree.body
+                           if isinstance(node, ast.Assign)
+                           and any(isinstance(t, ast.Name) and t.id == 'MODEL_CONFIG'
+                                   for t in node.targets))
+        config = ast.literal_eval(config_node.value)
+        apply_multiscale_environment(config)
+    if '--pretrained' in args:
+        assert '--pretrained' in flags
+        source = Path(args[args.index('--pretrained') + 1])
+        assert source.exists(), source
+        source_config = json.loads(source.read_text())['config']
+        assert source_config['encoder']['kernel_sizes'] == list(config['encoder']['kernel_sizes'])
+        source_stride = source_config['encoder']['stride']
+        target_stride = config['encoder']['stride']
+        assert source_stride == (list(target_stride) if isinstance(target_stride, tuple) else target_stride)
     destination.mkdir(parents=True, exist_ok=True)
     history = {'train_losses': [-1] * epochs, 'val_losses': [-1] * epochs}
     (destination / 'training_history.json').write_text(json.dumps(history))
-    (destination / 'best_model.pth').write_text(json.dumps({'epoch': epochs}))
+    (destination / 'best_model.pth').write_text(json.dumps({'epoch': epochs, 'config': config}))
     record('train', speakers=speakers, variant=variant, args=args,
-           epoch_size=epoch_size)
+           epoch_size=epoch_size, model_config=config, checkpoint_dir=str(destination))
     sys.exit(0)
 os.execv(os.environ['REAL_PYTHON'], [os.environ['REAL_PYTHON']] + args)
 '''
@@ -252,10 +274,13 @@ class SetupAndTrainTest(unittest.TestCase):
             check=True, capture_output=True, text=True,
         )
 
-    def run_wizard(self, model=6, epochs=1, configure=True, hours='1'):
+    def run_wizard(self, model=6, epochs=1, configure=True, hours='1',
+                   kernels='', strides=''):
         self.project = self.root / f'project with spaces {model}'
-        answers = [str(self.project), 'cpu', '0',
-                   str(model), str(epochs)]
+        answers = [str(self.project), 'cpu', '0', str(model)]
+        if model in (7, 8, 9):
+            answers.extend([kernels, strides])
+        answers.append(str(epochs))
         if model in (5, 6, 9):
             answers.append('1')
         answers.extend([str(hours), ''])
@@ -384,6 +409,52 @@ class SetupAndTrainTest(unittest.TestCase):
             text=True,
         ).strip()
         self.assertEqual(remote, REMOTE)
+
+    def test_multiscale_custom_sizes_transfer_and_saved_rerun(self):
+        result = self.run_wizard(model=9, kernels='40/80/160', strides='10/20/40')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Kernel sizes (short/middle/long)', result.stdout)
+        self.assertIn('strides: 10/20/40', result.stdout)
+        training = [e for e in self.events() if e['event'] == 'train']
+        self.assertEqual(len(training), 2)
+        for event in training:
+            for component in ('encoder', 'decoder'):
+                self.assertEqual(event['model_config'][component]['kernel_sizes'], [40, 80, 160])
+                self.assertEqual(event['model_config'][component]['stride'], [10, 20, 40])
+            self.assertIn('k40_80_160-s10_20_40', event['checkpoint_dir'])
+        self.assertIn('--pretrained', training[1]['args'])
+        config = (self.root / 'setup_and_train.env').read_text()
+        self.assertIn('MULTISCALE_KERNELS=40/80/160\n', config)
+        self.assertIn('MULTISCALE_STRIDES=10/20/40\n', config)
+        before = self.events()
+        result = self.run_wizard(model=9, configure=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.events(), before)
+
+    def test_multiscale_sizes_create_separate_experiments(self):
+        result = self.run_wizard(model=7, kernels='16/32/64', strides='8')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        original = next(e for e in self.events() if e['event'] == 'train')
+        self.assertEqual(original['model_config']['encoder']['stride'], 8)
+        self.assertIn('MULTISCALE_STRIDES=8/8/8\n', (self.root / 'setup_and_train.env').read_text())
+        result = self.run_wizard(model=7, kernels='40/80/160', strides='20/20/20')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        training = [e for e in self.events() if e['event'] == 'train']
+        self.assertEqual(len(training), 2)
+        self.assertNotEqual(training[0]['checkpoint_dir'], training[1]['checkpoint_dir'])
+        self.assertTrue((Path(training[0]['checkpoint_dir']) / 'best_model.pth').exists())
+        self.assertTrue((Path(training[1]['checkpoint_dir']) / 'best_model.pth').exists())
+        self.assertEqual(sum(e['event'] == 'generate' for e in self.events()), 2)
+
+    def test_multiscale_invalid_sizes_stop_before_setup(self):
+        for kernels, strides in (('16/32', '8'), ('32/16/64', '8'),
+                                 ('16/32/64', '0/8/8'), ('16/32/64', '8/16'),
+                                 ('16/32/64', '17/16/32')):
+            with self.subTest(kernels=kernels, strides=strides):
+                result = self.run_wizard(model=8, kernels=kernels, strides=strides)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Invalid multiscale configuration', result.stderr)
+                self.assertEqual(self.events(), [])
 
     def test_default_ten_hours_controls_train_dev_and_test(self):
         result = self.run_wizard(hours='')

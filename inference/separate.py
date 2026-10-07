@@ -75,6 +75,7 @@ _SKIM_KEYS = {
     "layer", "unit", "segment_size", "dropout", "mem_type", "seg_overlap",
 }
 _ATTN_KEYS = _SKIM_KEYS | {"num_heads"}
+_MULTISCALE_KEYS = (_SKIM_KEYS - {"seg_overlap"}) | {"num_scales"}
 
 
 def detect_arch(separator_cfg: dict, enc_cfg: dict = None) -> str:
@@ -108,7 +109,7 @@ def load_model(checkpoint_path: Path, device: torch.device):
     if arch == "multiscale":
         encoder = MultiScaleConvEncoder(**enc_cfg)
         decoder = MultiScaleConvDecoder(**dec_cfg)
-        kwargs = {k: v for k, v in sep_cfg.items() if k in _SKIM_KEYS}
+        kwargs = {k: v for k, v in sep_cfg.items() if k in _MULTISCALE_KEYS}
         separator = SkiMMultiScaleSeparator(**kwargs)
     elif arch == "attention":
         encoder = ConvEncoder(**enc_cfg)

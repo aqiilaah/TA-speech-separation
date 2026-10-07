@@ -15,12 +15,13 @@ from implementation.skim_multiscale.skim_multiscale import SkiM
 class SkiMMultiScaleSeparator(AbsSeparator):
     """SkiM Separator for Speech Separation with Multi-Scale inputs.
 
-    Accepts fused multi-scale latent features, processes them with Skipping
-    Memory LSTM (SegLSTM for intra-segment and MemLSTM for inter-segment),
-    and generates estimation masks for each source speaker.
+    Normalizes and projects concatenated scale features for Skipping Memory
+    LSTM (SegLSTM for intra-segment and MemLSTM for inter-segment). Estimates
+    one mask per scale and speaker and applies it to the original features.
+    num_scales=1 retains the legacy fused-feature separator.
 
     Args:
-        input_dim: Dimension of latent features (from MultiScaleConvEncoder, default: 256).
+        input_dim: Channels per scale and SkiM bottleneck width (default: 256).
         causal: Whether the separator is causal (streaming) or non-causal.
         num_spk: Number of speakers to separate (e.g. 2 or 3).
         predict_noise: Whether to output an additional noise mask.
@@ -30,6 +31,8 @@ class SkiMMultiScaleSeparator(AbsSeparator):
         segment_size: Length of each local segment K (default: 150).
         dropout: Dropout rate (default: 0.1).
         mem_type: Memory state type for Mem-LSTM ('hc', 'h', 'c', 'id', None).
+        num_scales: Number of concatenated scale branches. input_dim is the
+            channel count per scale; the SkiM bottleneck stays input_dim wide.
     """
 
     def __init__(
@@ -44,18 +47,27 @@ class SkiMMultiScaleSeparator(AbsSeparator):
         segment_size: int = 150,
         dropout: float = 0.1,
         mem_type: str = "hc",
+        num_scales: int = 1,
     ):
         super().__init__()
         self._num_spk = num_spk
         self.predict_noise = predict_noise
         self.segment_size = segment_size
         self.num_outputs = self.num_spk + 1 if self.predict_noise else self.num_spk
+        if num_scales < 1:
+            raise ValueError("num_scales must be positive")
+        self.feature_dim = input_dim * num_scales
+        if num_scales > 1:
+            # Fuse only the mask-estimation path; preserve W_i for M_i * W_i.
+            self.input_norm = nn.LayerNorm(self.feature_dim)
+            self.input_proj = nn.Linear(self.feature_dim, input_dim)
+        self.num_scales = num_scales
 
         # SkiM Model Engine
         self.skim = SkiM(
             input_size=input_dim,
             hidden_size=unit,
-            output_size=input_dim * self.num_outputs,
+            output_size=self.feature_dim * self.num_outputs,
             dropout=dropout,
             num_blocks=layer,
             segment_size=segment_size,
@@ -92,7 +104,12 @@ class SkiMMultiScaleSeparator(AbsSeparator):
             others: OrderedDict containing estimated masks.
         """
         B, T, N = input.shape
-        processed = self.skim(input)  # (B, T, N * num_outputs)
+        if N != self.feature_dim:
+            raise ValueError(f"Expected {self.feature_dim} feature channels, got {N}")
+        bottleneck = input
+        if self.num_scales > 1:
+            bottleneck = self.input_proj(self.input_norm(input))
+        processed = self.skim(bottleneck)  # (B, T, N * num_outputs)
         processed = processed.view(B, T, N, self.num_outputs)
 
         # Pisahkan masks untuk tiap speaker

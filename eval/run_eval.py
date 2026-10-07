@@ -38,6 +38,7 @@ DEFAULT_CONFIG = {'encoder': {'channel': 256, 'kernel_size': 16, 'stride': 8}, '
 
 _SKIM_KEYS = {'input_dim', 'causal', 'num_spk', 'predict_noise', 'nonlinear', 'layer', 'unit', 'segment_size', 'dropout', 'mem_type', 'seg_overlap'}
 _ATTN_KEYS = _SKIM_KEYS | {'num_heads'}
+_MULTISCALE_KEYS = (_SKIM_KEYS - {'seg_overlap'}) | {'num_scales'}
 
 def build_config(num_spk: int, arch: str) -> dict:
     cfg = {'encoder': dict(DEFAULT_CONFIG['encoder']), 'decoder': dict(DEFAULT_CONFIG['decoder']), 'separator': dict(DEFAULT_CONFIG['separator'])}
@@ -149,7 +150,7 @@ def build_model(num_spk: int, arch: str, ckpt_path: Path):
     if arch == 'multiscale':
         enc = MultiScaleConvEncoder(**cfg['encoder'])
         dec = MultiScaleConvDecoder(**cfg['decoder'])
-        sep = SkiMMultiScaleSeparator(**{k: v for k, v in sep_cfg.items() if k in _SKIM_KEYS})
+        sep = SkiMMultiScaleSeparator(**{k: v for k, v in sep_cfg.items() if k in _MULTISCALE_KEYS})
     elif arch == 'skim':
         enc = ConvEncoder(**cfg['encoder'])
         dec = ConvDecoder(**cfg['decoder'])

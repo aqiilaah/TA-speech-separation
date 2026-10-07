@@ -11,7 +11,7 @@ TTML-IDN.
 - Pemisahan suara dua dan tiga pembicara.
 - Model dasar SkiM.
 - Model SkiM dengan tambahan *intra-segment Multi-Head Self-Attention*.
-- Model SkiM dengan *Multi-Scale 1D Convolutional Encoder*.
+- Model SkiM dengan encoder dan decoder konvolusi multiskala serta loss per skala.
 - *Transfer learning* dari model dua pembicara ke model tiga pembicara.
 - Pembuatan campuran data latih secara *on-the-fly*.
 - Evaluasi SI-SNR pada seluruh *test set*.
@@ -28,7 +28,7 @@ TA-speech-separation/
 ├── implementation/
 │   ├── skim/               # Implementasi SkiM
 │   ├── skim_attention/     # Implementasi SkiM + Attention
-│   └── skim_multiscale/    # Implementasi SkiM + Multi-Scale Encoder
+│   └── skim_multiscale/    # Implementasi SkiM + Multi-Scale Encoder/Decoder
 ├── train/
 │   ├── 2speaker/           # Pelatihan model dua pembicara (skim, skim-attention, skim-multiscale)
 │   ├── 3speaker/           # Pelatihan model tiga pembicara (skim, skim-attention, skim-multiscale)
@@ -53,6 +53,22 @@ GPU, pilihan model, jumlah epoch, total jam dataset, serta URL
 atau path ZIP TITML. Source ZIP default berasal dari konfigurasi proyek.
 Password ZIP terenkripsi diminta secara tersembunyi jika belum tersedia;
 password tidak disimpan dalam berkas konfigurasi.
+
+Untuk model Multi-Scale (pilihan 7–9), wizard juga menanyakan kernel dan
+stride dalam **sampel audio**, berurutan short/middle/long:
+
+```text
+Kernel sizes (short/middle/long) [16/32/64]: 40/80/160
+Strides (short/middle/long; one value uses a shared stride) [8/8/8]: 10/20/40
+```
+
+Stride boleh berbeda untuk tiap skala; satu nilai seperti `20` berarti
+`20/20/20`. Kernel harus meningkat dan setiap stride harus positif serta
+tidak melebihi kernel pasangannya. Pilihan tersimpan dan dipakai juga untuk
+pretraining dua pembicara pada transfer learning. Setiap konfigurasi wizard
+memiliki folder checkpoint sendiri, misalnya
+`checkpoints/2speaker/skim-multiscale-k40_80_160-s10_20_40/`, sehingga mengganti
+kernel/stride tidak melanjutkan atau menimpa eksperimen konfigurasi lain.
 
 Python dipilih otomatis, tanpa pertanyaan versi atau path. Jika Python
 3.10/3.11 dengan dukungan `venv` tersedia, instalasi Python dilewati. Jika
@@ -262,6 +278,9 @@ checkpoints/2speaker/skim-attention/best_model.pth
 checkpoints/2speaker/skim-multiscale/best_model.pth
 ```
 
+Path Multi-Scale di atas adalah default training manual. Wizard menambahkan
+suffix kernel/stride pada nama folder untuk setiap konfigurasi.
+
 ### Model tiga pembicara dari awal
 
 ```bash
@@ -402,6 +421,16 @@ Konfigurasi model standar yang digunakan skrip pelatihan:
 - learning rate: 0,001;
 - gradient clipping: 5,0;
 - loss: SI-SNR dengan Permutation Invariant Training.
+
+Default varian `skim-multiscale` memakai kernel encoder/decoder `(16,32,64)`
+dengan stride 8, fitur dan mask terpisah per skala, serta bobot loss
+`(0.8,0.1,0.1)`. Inference memakai waveform skala pendek. Ini merupakan
+adaptasi SkiM yang terinspirasi TDNext; hasil verifikasi paper dan perbedaan
+arsitektur tersedia dalam [review paper](implementation/skim_multiscale/PAPER_REVIEW.md).
+Checkpoint multiskala lama tetap didukung untuk inference/evaluasi, tetapi
+arsitektur baru perlu dilatih ulang. Wizard memakai folder konfigurasi sendiri
+dan menyimpan checkpoint lama di lokasi semula. Untuk training manual,
+gunakan `--checkpoint-dir` yang berbeda saat mengubah arsitektur atau ukuran.
 
 GPU diperlukan untuk pelatihan dalam waktu yang praktis. Checkpoint dan
 dataset audio tidak disertakan dalam Git karena ukuran berkasnya besar.

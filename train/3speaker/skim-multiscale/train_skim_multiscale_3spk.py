@@ -27,15 +27,18 @@ from datasets_utils import (
     build_utterance_split,
 )
 from utils.paths import get_raw_dir, get_synthetic_dir, get_checkpoint_dir
+from utils.multiscale_config import apply_multiscale_environment
 
 try:
-    from espnet2.enh.espnet_model import ESPnetEnhancementModel
+    from implementation.skim_multiscale.multiscale_model import (
+        MultiScaleEnhancementModel,
+        MultiScalePITSolver,
+    )
     from espnet2.enh.loss.criterions.time_domain import SISNRLoss
-    from espnet2.enh.loss.wrappers.pit_solver import PITSolver
 except ImportError:
-    ESPnetEnhancementModel = None
+    MultiScaleEnhancementModel = None
     SISNRLoss = None
-    PITSolver = None
+    MultiScalePITSolver = None
 
 from implementation.skim_multiscale.multiscale_encoder import MultiScaleConvEncoder
 from implementation.skim_multiscale.skim_multiscale_separator import (
@@ -46,19 +49,21 @@ from implementation.skim_multiscale.multiscale_decoder import MultiScaleConvDeco
 MODEL_CONFIG = {
     "encoder": {
         "channel": 256,
-        "out_channel": 256,
         "kernel_sizes": (16, 32, 64),
         "stride": 8,
         "causal": False,
         "nonlinear": "relu",
+        "preserve_scales": True,
     },
     "decoder": {
         "channel": 256,
-        "kernel_size": 16,
+        "kernel_sizes": (16, 32, 64),
         "stride": 8,
+        "causal": False,
     },
     "separator": {
         "input_dim": 256,
+        "num_scales": 3,
         "causal": False,
         "num_spk": 3,
         "predict_noise": False,
@@ -71,12 +76,15 @@ MODEL_CONFIG = {
     },
 }
 
+apply_multiscale_environment(MODEL_CONFIG)
+
 TRAIN_CONFIG = {
     "batch_size": 8,
     "num_epochs": 100,
     "learning_rate": 0.001,
     "weight_decay": 0.0,
     "gradient_clip": 5.0,
+    "scale_loss_weights": (0.8, 0.1, 0.1),
     "seed": 42,
 }
 
@@ -114,7 +122,7 @@ def resolve_resume_path(resume_from):
 
 
 def build_model(device):
-    if ESPnetEnhancementModel is None:
+    if MultiScaleEnhancementModel is None:
         raise ImportError(
             "ESPnet2 tidak ditemukan di environment Python saat ini. "
             "Pastikan telah menginstal dependensi: pip install espnet espnet_model_zoo"
@@ -124,51 +132,29 @@ def build_model(device):
     print("Building SkiM Multi-Scale 3-Speaker Model")
     print("=" * 60)
 
-    encoder = MultiScaleConvEncoder(
-        channel=MODEL_CONFIG["encoder"]["channel"],
-        out_channel=MODEL_CONFIG["encoder"]["out_channel"],
-        kernel_sizes=MODEL_CONFIG["encoder"]["kernel_sizes"],
-        stride=MODEL_CONFIG["encoder"]["stride"],
-        causal=MODEL_CONFIG["encoder"]["causal"],
-        nonlinear=MODEL_CONFIG["encoder"]["nonlinear"],
-    )
+    encoder = MultiScaleConvEncoder(**MODEL_CONFIG["encoder"])
     print(
         f"Encoder: MultiScaleConvEncoder (kernels: {MODEL_CONFIG['encoder']['kernel_sizes']}, "
-        f"stride: {MODEL_CONFIG['encoder']['stride']}, out: {MODEL_CONFIG['encoder']['out_channel']})"
+        f"stride: {MODEL_CONFIG['encoder']['stride']}, out: {encoder.output_dim})"
     )
 
-    separator = SkiMMultiScaleSeparator(
-        input_dim=MODEL_CONFIG["separator"]["input_dim"],
-        causal=MODEL_CONFIG["separator"]["causal"],
-        num_spk=MODEL_CONFIG["separator"]["num_spk"],
-        predict_noise=MODEL_CONFIG["separator"]["predict_noise"],
-        nonlinear=MODEL_CONFIG["separator"]["nonlinear"],
-        layer=MODEL_CONFIG["separator"]["layer"],
-        unit=MODEL_CONFIG["separator"]["unit"],
-        segment_size=MODEL_CONFIG["separator"]["segment_size"],
-        dropout=MODEL_CONFIG["separator"]["dropout"],
-        mem_type=MODEL_CONFIG["separator"]["mem_type"],
-    )
+    separator = SkiMMultiScaleSeparator(**MODEL_CONFIG["separator"])
     print(
         f"Separator: SkiMMultiScaleSeparator ({MODEL_CONFIG['separator']['layer']} layers, "
         f"{MODEL_CONFIG['separator']['unit']} units, {MODEL_CONFIG['separator']['num_spk']} speakers)"
     )
 
-    decoder = MultiScaleConvDecoder(
-        channel=MODEL_CONFIG["decoder"]["channel"],
-        kernel_size=MODEL_CONFIG["decoder"]["kernel_size"],
-        stride=MODEL_CONFIG["decoder"]["stride"],
-    )
+    decoder = MultiScaleConvDecoder(**MODEL_CONFIG["decoder"])
     print(
-        f"Decoder: MultiScaleConvDecoder (kernel: {MODEL_CONFIG['decoder']['kernel_size']}, "
+        f"Decoder: MultiScaleConvDecoder (kernels: {MODEL_CONFIG['decoder']['kernel_sizes']}, "
         f"stride: {MODEL_CONFIG['decoder']['stride']})"
     )
 
     criterion = SISNRLoss()
-    pit_wrapper = PITSolver(criterion=criterion)
-    print("Loss: SI-SNR with PIT")
+    pit_wrapper = MultiScalePITSolver(criterion, TRAIN_CONFIG["scale_loss_weights"])
+    print(f"Loss: multi-scale SI-SNR with shared PIT, weights {pit_wrapper.scale_weights}")
 
-    model = ESPnetEnhancementModel(
+    model = MultiScaleEnhancementModel(
         encoder=encoder,
         separator=separator,
         decoder=decoder,
@@ -241,7 +227,7 @@ def train_epoch(model, train_loader, optimizer, scaler, device, epoch):
         ref_lengths = mix_lengths.clone()
 
         optimizer.zero_grad()
-        with torch.amp.autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
+        with torch.amp.autocast(device_type=device.type, enabled=device.type == "cuda"):
             loss, stats, weight = model(
                 speech_mix=mix,
                 speech_mix_lengths=mix_lengths,
@@ -287,7 +273,7 @@ def validate(model, val_loader, device, epoch):
             mix_lengths = torch.full((batch_size,), mix.size(1), dtype=torch.long, device=device)
             ref_lengths = mix_lengths.clone()
 
-            with torch.amp.autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
+            with torch.amp.autocast(device_type=device.type, enabled=device.type == "cuda"):
                 loss, stats, weight = model(
                     speech_mix=mix,
                     speech_mix_lengths=mix_lengths,
